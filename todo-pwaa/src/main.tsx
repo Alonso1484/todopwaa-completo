@@ -14,8 +14,8 @@ import Register from "./pages/Register";
 import ProtectedRoute from "./routes/ProtectedRoute";
 
 // Componentes
-import PwaUpdater from "./Components/PwaUpdater";
-import Toaster from "./Components/Toaster";
+import PwaUpdater from "./components/PwaUpdater";
+import Toaster from "./components/Toaster";
 
 // Instalación PWA
 import "./installPrompt";
