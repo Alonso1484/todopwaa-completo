@@ -1,252 +1,283 @@
-
 import { api } from "../api";
 
 import {
   getOutbox,
-  removeOutbox,
-  setMapping,
   getMapping,
-  removeTaskLocal,
   promoteLocalToServer,
-  getAllTasksLocal,
-  putTaskLocal,
+  acknowledgeOperations,
   type OutboxOp,
 } from "./db";
 
+import type { Task, TaskPatch } from "../types";
+
+interface SyncMapping {
+  clienteId: string;
+  serverId: string;
+}
+
+interface BulkSyncResponse {
+  mapping?: SyncMapping[];
+  skipped?: number;
+}
+
 let syncing: Promise<void> | null = null;
+let requested = false;
 
-async function performSync(): Promise<void> {
-  if (!navigator.onLine) return;
+function operationTaskId(op: OutboxOp): string {
+  return op.op === "create"
+    ? op.clienteId
+    : op.serverId;
+}
 
-  const ops = (await getOutbox()).sort(
-    (a, b) => a.ts - b.ts
-  );
+// El backend mostrado utiliza ObjectId de MongoDB.
+function isServerId(id: string): boolean {
+  return /^[a-f\d]{24}$/i.test(id);
+}
 
-  if (!ops.length) return;
+async function resolveServerId(
+  id: string
+): Promise<string | undefined> {
+  const mapped = await getMapping(id);
 
-  // Agrupar las operaciones por tarea
+  if (mapped) return mapped;
+
+  return isServerId(id) ? id : undefined;
+}
+
+function editableFields(task: Task): TaskPatch {
+  return {
+    title: task.title,
+    description: task.description,
+    status: task.status,
+    priority: task.priority,
+    dueDate: task.dueDate,
+  };
+}
+
+function getHttpStatus(error: unknown): number | undefined {
+  return (
+    error as {
+      response?: {
+        status?: number;
+      };
+    } | null
+  )?.response?.status;
+}
+
+async function groupOperations(
+  ops: OutboxOp[]
+): Promise<Map<string, OutboxOp[]>> {
   const groups = new Map<string, OutboxOp[]>();
 
   for (const op of ops) {
-    const id =
-      op.clienteId ??
-      ("serverId" in op ? op.serverId : undefined);
+    const id = operationTaskId(op);
+    const serverId = await resolveServerId(id);
 
-    if (!id) continue;
+    const key = serverId
+      ? `server:${serverId}`
+      : `local:${id}`;
 
-    if (!groups.has(id)) {
-      groups.set(id, []);
-    }
+    const group = groups.get(key) ?? [];
 
-    groups.get(id)!.push(op);
+    group.push(op);
+    groups.set(key, group);
   }
 
-  // Procesar las tareas pendientes
-  for (const [id, taskOps] of groups) {
-    try {
-      const createOp = taskOps.find(
-        (op) => op.op === "create"
-      );
+  return groups;
+}
 
-      const deleteOp = taskOps.find(
-        (op) => op.op === "delete"
-      );
+async function syncGroup(
+  operations: OutboxOp[]
+): Promise<void> {
+  const createOp = operations.find(
+    (op): op is Extract<OutboxOp, { op: "create" }> =>
+      op.op === "create"
+  );
 
-      const updates = taskOps.filter(
-        (op) => op.op === "update"
-      );
+  const hasDelete = operations.some(
+    (op) => op.op === "delete"
+  );
 
-      // Unir los cambios realizados sin internet
-      const changes: Record<string, any> = {};
+  const changes: TaskPatch = {};
 
-      for (const op of updates) {
-        if (op.op === "update") {
-          Object.assign(changes, op.data);
-        }
-      }
+  // Si quedó un create de un intento anterior,
+  // también deben enviarse sus campos actuales.
+  if (createOp) {
+    Object.assign(changes, editableFields(createOp.data));
+  }
 
-      const mappedId = await getMapping(id);
+  for (const op of operations) {
+    if (op.op === "update") {
+      Object.assign(changes, op.data);
+    }
+  }
 
-      const opConServerId = taskOps.find(
-        (op) => "serverId" in op && op.serverId
-      );
+  let serverId: string | undefined;
 
-      let serverId: string | undefined =
-        opConServerId &&
-        "serverId" in opConServerId
-          ? opConServerId.serverId
-          : mappedId;
+  for (const op of operations) {
+    serverId = await resolveServerId(operationTaskId(op));
 
-      // Tarea creada y eliminada sin internet
-      if (createOp && deleteOp && !serverId) {
-        await removeTaskLocal(id);
+    if (serverId) break;
+  }
 
-        for (const op of taskOps) {
-          await removeOutbox(op.id);
-        }
+  let createdNow = false;
 
-        continue;
-      }
-
-      // Crear tarea en MongoDB
-      if (createOp?.op === "create" && !serverId) {
-        const payload = {
-          ...createOp.data,
-          ...changes,
-          clienteId: createOp.clienteId,
-          description:
-            changes.description ??
-            createOp.data.description ??
-            "",
-          status:
-            changes.status ??
-            createOp.data.status ??
-            "Pendiente",
-        };
-
-        const { data } = await api.post(
-          "/tasks/bulksync",
+  if (createOp && !serverId) {
+    const response = await api.post<BulkSyncResponse>(
+      "/tasks/bulksync",
+      {
+        tasks: [
           {
-            tasks: [payload],
-          }
-        );
-
-        const mapping = data?.mapping?.find(
-          (m: any) =>
-            m.clienteId === createOp.clienteId
-        );
-
-        if (!mapping?.serverId) {
-          throw new Error(
-            "No se recibió el ID de MongoDB"
-          );
-        }
-
-        // Guardar el ID recibido del servidor
-        const nuevoServerId: string = mapping.serverId;
-
-        serverId = nuevoServerId;
-
-        await setMapping(
-          createOp.clienteId,
-          nuevoServerId
-        );
+            ...changes,
+            clienteId: createOp.clienteId,
+          },
+        ],
       }
+    );
 
-      // Eliminar una tarea
-      if (deleteOp) {
-        if (!serverId) {
-          throw new Error(
-            "No se encontró el ID para eliminar"
-          );
-        }
+    const mapping = response.data.mapping?.find(
+      (item) => item.clienteId === createOp.clienteId
+    );
 
-        await api.delete(`/tasks/${serverId}`);
-
-        await removeTaskLocal(id);
-        await removeTaskLocal(serverId);
-
-        for (const op of taskOps) {
-          await removeOutbox(op.id);
-        }
-
-        continue;
-      }
-
-      if (!serverId) {
-        throw new Error(
-          "No se encontró el ID de la tarea"
-        );
-      }
-
-      // Actualizar tarea creada sin internet
-      if (createOp?.op === "create") {
-        await api.put(`/tasks/${serverId}`, {
-          title:
-            changes.title ?? createOp.data.title,
-          description:
-            changes.description ??
-            createOp.data.description ??
-            "",
-          status:
-            changes.status ??
-            createOp.data.status ??
-            "Pendiente",
-        });
-
-        await promoteLocalToServer(
-          createOp.clienteId,
-          serverId
-        );
-      } else if (updates.length > 0) {
-        // Actualizar tarea existente
-        await api.put(
-          `/tasks/${serverId}`,
-          changes
-        );
-      }
-
-      // Actualizar los datos locales
-      const localTasks = await getAllTasksLocal();
-
-      const local = localTasks.find(
-        (t: any) =>
-          t._id === id ||
-          t._id === serverId
-      );
-
-      if (local) {
-        if (id !== serverId) {
-          await removeTaskLocal(id);
-        }
-
-        await putTaskLocal({
-          ...local,
-          ...changes,
-          _id: serverId,
-          pending: false,
-        });
-      }
-
-      // Eliminar operaciones ya sincronizadas
-      for (const op of taskOps) {
-        await removeOutbox(op.id);
-      }
-
-      console.log(
-        `Tarea ${serverId} sincronizada correctamente`
-      );
-    } catch (error) {
-      console.error(
-        `Error sincronizando tarea ${id}:`,
-        error
+    if (!mapping || !isServerId(mapping.serverId)) {
+      throw new Error(
+        `El servidor no devolvió un ID válido para ${createOp.clienteId}`
       );
     }
+
+    serverId = mapping.serverId;
+
+    await promoteLocalToServer(
+      createOp.clienteId,
+      serverId
+    );
+
+    createdNow = true;
+  }
+
+  if (!serverId) {
+    throw new Error(
+      `No existe mapping ni creación pendiente para ${
+        operationTaskId(operations[0])
+      }`
+    );
+  }
+
+  // También completar la promoción al recuperar
+  // un create que ya tenía mapping.
+  if (createOp && !createdNow) {
+    await promoteLocalToServer(
+      createOp.clienteId,
+      serverId
+    );
+  }
+
+  if (hasDelete) {
+    // Incluso si se creó y eliminó offline, primero
+    // resolvemos su ID para cubrir un POST anterior
+    // cuya respuesta pudo haberse perdido.
+    try {
+      await api.delete(
+        `/tasks/${encodeURIComponent(serverId)}`
+      );
+    } catch (error: unknown) {
+      if (getHttpStatus(error) !== 404) {
+        throw error;
+      }
+    }
+  } else if (
+    !createdNow &&
+    Object.keys(changes).length > 0
+  ) {
+    await api.put(
+      `/tasks/${encodeURIComponent(serverId)}`,
+      changes
+    );
+  }
+
+  // Solo confirma las revisiones enviadas.
+  // Las revisiones nuevas permanecen en la outbox.
+  await acknowledgeOperations(operations);
+}
+
+async function performSync(): Promise<void> {
+  // Evita reintentar la misma revisión fallida
+  // continuamente dentro de esta ejecución.
+  const failed = new Set<string>();
+
+  while (navigator.onLine) {
+    const operations = await getOutbox();
+
+    if (operations.length === 0) return;
+
+    const groups = await groupOperations(operations);
+
+    let processed = 0;
+
+    for (const [key, group] of groups) {
+      if (!navigator.onLine) return;
+
+      const signature = JSON.stringify([
+        key,
+        group.map((op) => [op.id, op.rev]),
+      ]);
+
+      if (failed.has(signature)) continue;
+
+      try {
+        await syncGroup(group);
+        processed++;
+      } catch (error: unknown) {
+        failed.add(signature);
+
+        console.error(
+          `Error sincronizando ${key}:`,
+          error
+        );
+      }
+    }
+
+    // Si no hubo avances, dejar las operaciones
+    // pendientes para el siguiente intento.
+    if (processed === 0) return;
+
+    // Volver a leer la outbox para procesar cambios
+    // guardados mientras esperábamos al servidor.
   }
 }
 
 export function syncNow(): Promise<void> {
-  if (!navigator.onLine) {
-    return Promise.resolve();
-  }
+  requested = true;
 
   if (syncing) return syncing;
 
-  const run = performSync().finally(() => {
+  syncing = (async () => {
+    while (requested && navigator.onLine) {
+      requested = false;
+      await performSync();
+    }
+  })().finally(() => {
     syncing = null;
   });
 
-  syncing = run;
-
-  return run;
+  return syncing;
 }
 
-export function setupOnlineSync() {
+export function setupOnlineSync(): () => void {
   const handler = () => {
-    void syncNow();
+    void syncNow().catch((error: unknown) => {
+      console.error(
+        "Error general de sincronización:",
+        error
+      );
+    });
   };
 
   window.addEventListener("online", handler);
+
+  if (navigator.onLine) {
+    handler();
+  }
 
   return () => {
     window.removeEventListener("online", handler);
