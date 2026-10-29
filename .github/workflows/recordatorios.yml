@@ -1,0 +1,22 @@
+# Dispara los recordatorios push cada 15 minutos.
+# Secretos necesarios (Settings → Secrets and variables → Actions):
+#   API_URL      = https://tu-api.vercel.app   (sin "/" al final)
+#   CRON_SECRET  = el mismo valor que en las variables de entorno de Vercel
+name: Recordatorios push
+
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # GitHub puede retrasarlo unos minutos en horas pico
+  workflow_dispatch:          # botón "Run workflow" para probarlo a mano
+
+
+jobs:
+  recordatorios:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Llamar al endpoint del cron
+        run: |
+          curl --fail-with-body -sS \
+            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
+            "${{ secrets.API_URL }}/api/cron/reminders"
